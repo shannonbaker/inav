@@ -47,6 +47,7 @@ typedef enum {
     MSP_GHOST_DP_SUBSCRIPTION_RENEW = 0x14,
     MSP_GHOST_DP_SUBSCRIPTION_RELEASE = 0x15,
     MSP_GHOST_DP_STREAM_MAP = 0x20,
+    MSP_GHOST_DP_FIELD_DATA = 0x21,
 } mspGhostDpMessageType_e;
 
 typedef enum {

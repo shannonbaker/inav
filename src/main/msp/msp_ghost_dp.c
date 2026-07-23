@@ -20,11 +20,23 @@
 #include "drivers/system.h"
 #include "drivers/time.h"
 
+#include "fc/runtime_config.h"
+
+#include "flight/imu.h"
+
 #include "io/displayport_msp.h"
+#ifdef USE_GPS
+#include "io/gps.h"
+#endif
 
 #include "msp/msp_ghost_dp.h"
 #include "msp/msp_protocol.h"
 #include "msp/msp_serial.h"
+
+#include "rx/rx.h"
+
+#include "sensors/battery.h"
+#include "sensors/sensors.h"
 
 typedef struct mspGhostDpHeader_s {
     uint8_t version;
@@ -84,6 +96,7 @@ typedef struct mspGhostDpStreamEntry_s {
     uint8_t slot;
     uint8_t instance;
     uint16_t effectiveRateHz;
+    uint32_t nextDueUs;
     const mspGhostDpFieldDescriptor_t *field;
 } mspGhostDpStreamEntry_t;
 
@@ -392,7 +405,8 @@ static void mspGhostDpWriteHelloResponse(sbuf_t *dst,
     sbufWriteU32(dst, 0);
 
     sbufWriteU32(dst, mspGhostDpCatalogHash());
-    sbufWriteU32(dst, (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4));
+    sbufWriteU32(dst, (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4) |
+        (1u << 5));
     sbufWriteU16(dst, MSP_PORT_INBUF_SIZE);  // max_payload
     sbufWriteU32(dst, MSP_GHOST_DP_MAX_STREAM_BPS);
     sbufWriteU8(dst, MSP_GHOST_DP_MAX_SLOTS);
@@ -703,6 +717,7 @@ static void mspGhostDpCacheMutation(const mspGhostDpHeader_t *request,
 
 static void mspGhostDpApplyQuote(uint32_t nowMs)
 {
+    const uint32_t nowUs = micros();
     ghostStream.active = true;
     ghostStream.entryCount = 0;
     ghostStream.leaseSeconds = ghostQuote.leaseSeconds;
@@ -721,6 +736,7 @@ static void mspGhostDpApplyQuote(uint32_t nowMs)
         stream->slot = ghostStream.entryCount;
         stream->instance = quoted->instance;
         stream->effectiveRateHz = quoted->offeredRateHz;
+        stream->nextDueUs = nowUs;
         stream->field = quoted->field;
         ++ghostStream.entryCount;
     }
@@ -751,6 +767,155 @@ static int mspGhostDpPushStreamMap(void)
     const int payloadLength = sbufPtr(&dst) - payload;
     return mspSerialPush(displayPortMspGetSerial(), MSP_DISPLAYPORT, payload,
         payloadLength, MSP_DIRECTION_REPLY, MSP_V2_NATIVE);
+}
+
+enum {
+    MSP_GHOST_DP_VALUE_VALID = 1 << 0,
+};
+
+static uint8_t mspGhostDpSampleField(const mspGhostDpStreamEntry_t *entry,
+    uint8_t *value, uint8_t *valueFlags)
+{
+    bool valid = true;
+    uint32_t rawValue = 0;
+
+    switch (entry->field->id) {
+    case 1: // PITCH, decidegrees
+        rawValue = (uint16_t)attitude.values.pitch;
+        valid = sensors(SENSOR_ACC);
+        break;
+    case 2: // ROLL, decidegrees
+        rawValue = (uint16_t)attitude.values.roll;
+        valid = sensors(SENSOR_ACC);
+        break;
+    case 3: // HEADING, decidegrees
+        rawValue = (uint16_t)attitude.values.yaw;
+        break;
+#ifdef USE_GPS
+    case 4: // LATITUDE, degrees * 1e-7
+        rawValue = (uint32_t)gpsSol.llh.lat;
+        valid = STATE(GPS_FIX);
+        break;
+    case 5: // LONGITUDE, degrees * 1e-7
+        rawValue = (uint32_t)gpsSol.llh.lon;
+        valid = STATE(GPS_FIX);
+        break;
+    case 6: // GPS_ALTITUDE, centimetres
+        rawValue = (uint32_t)gpsSol.llh.altCm;
+        valid = STATE(GPS_FIX);
+        break;
+    case 7: // GROUND_SPEED, centimetres per second
+        rawValue = gpsSol.groundSpeed;
+        valid = STATE(GPS_FIX);
+        break;
+#endif
+    case 8: // BATTERY_VOLTAGE, millivolts
+        rawValue = getBatteryVoltage() * 10u;
+        valid = getVoltageState() != BATTERY_NOT_PRESENT &&
+            getVoltageState() != BATTERY_INIT;
+        break;
+    case 9: // BATTERY_CURRENT, centiamperes
+        rawValue = (uint32_t)getAmperage();
+        valid = isAmperageConfigured();
+        break;
+    case 10: // BATTERY_MAH, milliampere-hours
+        rawValue = (uint32_t)getMAhDrawn();
+        valid = isAmperageConfigured();
+        break;
+#ifdef USE_GPS
+    case 11: // GPS_SATELLITES
+        rawValue = gpsSol.numSat;
+        valid = sensors(SENSOR_GPS);
+        break;
+    case 12: // HOME_BEARING, decidegrees
+        rawValue = (uint16_t)GPS_directionToHome;
+        valid = STATE(GPS_FIX_HOME);
+        break;
+#endif
+    case 13: // HEADING_VALID
+        rawValue = sensors(SENSOR_MAG) ? 1u : 0u;
+        break;
+#ifdef USE_GPS
+    case 14: // GPS_FIX
+        rawValue = STATE(GPS_FIX) ? 1u : 0u;
+        break;
+    case 15: // HOME_VALID
+        rawValue = STATE(GPS_FIX_HOME) ? 1u : 0u;
+        break;
+#endif
+    default:
+        if (entry->field->id >= 32 && entry->field->id <= 49) {
+            const unsigned channel = entry->field->id - 32;
+            valid = channel < rxRuntimeState.channelCount;
+            rawValue = valid ? (uint16_t)rcData[channel] : 0;
+        } else {
+            valid = false;
+        }
+        break;
+    }
+
+    *valueFlags = valid ? MSP_GHOST_DP_VALUE_VALID : 0;
+    const uint8_t valueSize = mspGhostDpValueSize(entry->field->valueType);
+    for (unsigned index = 0; index < valueSize; ++index) {
+        value[index] = rawValue >> (index * 8);
+    }
+    return valueSize;
+}
+
+static int mspGhostDpPushFieldData(uint32_t nowUs)
+{
+    uint8_t payload[MSP_GHOST_DP_NEGOTIATION_PAYLOAD_MAX];
+    sbuf_t dst = { .ptr = payload, .end = payload + sizeof(payload) };
+    bool due[MSP_GHOST_DP_MAX_SLOTS] = { false };
+    uint8_t dueCount = 0;
+
+    for (unsigned index = 0; index < ghostStream.entryCount; ++index) {
+        if (cmp32(nowUs, ghostStream.entries[index].nextDueUs) >= 0) {
+            due[index] = true;
+            ++dueCount;
+        }
+    }
+    if (dueCount == 0) {
+        return 0;
+    }
+
+    mspGhostDpWriteHeader(&dst, MSP_GHOST_DP_FIELD_DATA, 0,
+        MSP_GHOST_DP_ENDPOINT_VRX, ghostSessionId, mspGhostDpNextPushExchange());
+    sbufWriteU16(&dst, ghostStream.generation);
+    sbufWriteU8(&dst, dueCount);
+    for (unsigned index = 0; index < ghostStream.entryCount; ++index) {
+        if (!due[index]) {
+            continue;
+        }
+        const mspGhostDpStreamEntry_t *entry = &ghostStream.entries[index];
+        uint8_t value[8];
+        uint8_t valueFlags;
+        const uint8_t valueSize = mspGhostDpSampleField(entry, value,
+            &valueFlags);
+        sbufWriteU8(&dst, entry->slot);
+        sbufWriteU8(&dst, valueFlags);
+        sbufWriteU8(&dst, valueSize);
+        sbufWriteData(&dst, value, valueSize);
+    }
+
+    const int payloadLength = sbufPtr(&dst) - payload;
+    const int written = mspSerialPush(displayPortMspGetSerial(),
+        MSP_DISPLAYPORT, payload, payloadLength, MSP_DIRECTION_REPLY,
+        MSP_V2_NATIVE);
+    if (written <= 0) {
+        return written;
+    }
+
+    for (unsigned index = 0; index < ghostStream.entryCount; ++index) {
+        if (!due[index]) {
+            continue;
+        }
+        mspGhostDpStreamEntry_t *entry = &ghostStream.entries[index];
+        const uint32_t intervalUs = 1000000u / entry->effectiveRateHz;
+        const uint32_t elapsedUs = nowUs - entry->nextDueUs;
+        entry->nextDueUs += (elapsedUs / intervalUs + 1u) * intervalUs;
+    }
+    return written;
 }
 
 static bool mspGhostDpHeaderIsRequest(const mspGhostDpHeader_t *request)
@@ -952,8 +1117,14 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
 void mspGhostDpProcess(void)
 {
     mspGhostDpExpireStream(millis());
-    if (ghostStreamMapPending && mspGhostDpPushStreamMap() > 0) {
-        ghostStreamMapPending = false;
+    if (ghostStreamMapPending) {
+        if (mspGhostDpPushStreamMap() > 0) {
+            ghostStreamMapPending = false;
+        }
+        return;
+    }
+    if (ghostStream.active) {
+        mspGhostDpPushFieldData(micros());
     }
 }
 
