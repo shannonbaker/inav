@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "platform.h"
 
@@ -29,8 +30,126 @@ typedef struct mspGhostDpHeader_s {
     uint16_t exchangeId;
 } mspGhostDpHeader_t;
 
+typedef struct mspGhostDpFieldDescriptor_s {
+    uint16_t id;
+    uint8_t valueType;
+    uint8_t unit;
+    int8_t scaleExponent;
+    uint16_t flags;
+    uint16_t maximumRateHz;
+    uint16_t nativeRateHz;
+    uint8_t instanceCount;
+    const char *name;
+} mspGhostDpFieldDescriptor_t;
+
+#define FIELD_SIGNED MSP_GHOST_DP_FIELD_SIGNED
+#define FIELD_INVALID MSP_GHOST_DP_FIELD_TEMPORARILY_INVALID
+#define RC_FIELD(channel, id) \
+    { id, MSP_GHOST_DP_VALUE_U16, MSP_GHOST_DP_UNIT_SECOND, -6, \
+      FIELD_INVALID, 100, 100, 1, "RC" #channel }
+
+static const mspGhostDpFieldDescriptor_t fieldCatalog[] = {
+    { 1, MSP_GHOST_DP_VALUE_I16, MSP_GHOST_DP_UNIT_DEGREE, -1,
+      FIELD_SIGNED, 100, 100, 1, "PITCH" },
+    { 2, MSP_GHOST_DP_VALUE_I16, MSP_GHOST_DP_UNIT_DEGREE, -1,
+      FIELD_SIGNED, 100, 100, 1, "ROLL" },
+    { 3, MSP_GHOST_DP_VALUE_U16, MSP_GHOST_DP_UNIT_DEGREE, -1,
+      0, 100, 100, 1, "HEADING" },
+#ifdef USE_GPS
+    { 4, MSP_GHOST_DP_VALUE_I32, MSP_GHOST_DP_UNIT_DEGREE, -7,
+      FIELD_SIGNED | FIELD_INVALID, 10, 10, 1, "LATITUDE" },
+    { 5, MSP_GHOST_DP_VALUE_I32, MSP_GHOST_DP_UNIT_DEGREE, -7,
+      FIELD_SIGNED | FIELD_INVALID, 10, 10, 1, "LONGITUDE" },
+    { 6, MSP_GHOST_DP_VALUE_I32, MSP_GHOST_DP_UNIT_METRE, -2,
+      FIELD_SIGNED | FIELD_INVALID, 10, 10, 1, "GPS_ALTITUDE" },
+    { 7, MSP_GHOST_DP_VALUE_U16, MSP_GHOST_DP_UNIT_METRES_PER_SECOND, -2,
+      FIELD_INVALID, 10, 10, 1, "GROUND_SPEED" },
+#endif
+    { 8, MSP_GHOST_DP_VALUE_U16, MSP_GHOST_DP_UNIT_VOLT, -3,
+      FIELD_INVALID, 20, 10, 1, "BATTERY_VOLTAGE" },
+    { 9, MSP_GHOST_DP_VALUE_I32, MSP_GHOST_DP_UNIT_AMPERE, -2,
+      FIELD_SIGNED | FIELD_INVALID, 20, 10, 1, "BATTERY_CURRENT" },
+    { 10, MSP_GHOST_DP_VALUE_I32, MSP_GHOST_DP_UNIT_AMPERE_HOUR, -3,
+      FIELD_SIGNED | FIELD_INVALID, 20, 10, 1, "BATTERY_MAH" },
+#ifdef USE_GPS
+    { 11, MSP_GHOST_DP_VALUE_U8, MSP_GHOST_DP_UNIT_COUNT, 0,
+      FIELD_INVALID, 10, 10, 1, "GPS_SATELLITES" },
+    { 12, MSP_GHOST_DP_VALUE_U16, MSP_GHOST_DP_UNIT_DEGREE, -1,
+      FIELD_INVALID, 10, 10, 1, "HOME_BEARING" },
+#endif
+    { 13, MSP_GHOST_DP_VALUE_BOOL, MSP_GHOST_DP_UNIT_NONE, 0,
+      0, 10, 10, 1, "HEADING_VALID" },
+#ifdef USE_GPS
+    { 14, MSP_GHOST_DP_VALUE_BOOL, MSP_GHOST_DP_UNIT_NONE, 0,
+      0, 10, 10, 1, "GPS_FIX" },
+    { 15, MSP_GHOST_DP_VALUE_BOOL, MSP_GHOST_DP_UNIT_NONE, 0,
+      0, 10, 10, 1, "HOME_VALID" },
+#endif
+    RC_FIELD(1, 32),
+    RC_FIELD(2, 33),
+    RC_FIELD(3, 34),
+    RC_FIELD(4, 35),
+    RC_FIELD(5, 36),
+    RC_FIELD(6, 37),
+    RC_FIELD(7, 38),
+    RC_FIELD(8, 39),
+    RC_FIELD(9, 40),
+    RC_FIELD(10, 41),
+    RC_FIELD(11, 42),
+    RC_FIELD(12, 43),
+    RC_FIELD(13, 44),
+    RC_FIELD(14, 45),
+    RC_FIELD(15, 46),
+    RC_FIELD(16, 47),
+    RC_FIELD(17, 48),
+    RC_FIELD(18, 49),
+};
+
+#undef RC_FIELD
+#undef FIELD_INVALID
+#undef FIELD_SIGNED
+
 static uint32_t ghostBootId;
 static uint16_t ghostSessionId;
+static uint32_t ghostCatalogHash;
+
+static uint32_t fnv1aByte(uint32_t hash, uint8_t value)
+{
+    return (hash ^ value) * 16777619u;
+}
+
+static uint32_t mspGhostDpCatalogHash(void)
+{
+    if (ghostCatalogHash != 0) {
+        return ghostCatalogHash;
+    }
+
+    uint32_t hash = 2166136261u;
+    for (unsigned index = 0; index < sizeof(fieldCatalog) / sizeof(fieldCatalog[0]); ++index) {
+        const mspGhostDpFieldDescriptor_t *field = &fieldCatalog[index];
+        hash = fnv1aByte(hash, field->id);
+        hash = fnv1aByte(hash, field->id >> 8);
+        hash = fnv1aByte(hash, field->valueType);
+        hash = fnv1aByte(hash, field->unit);
+        hash = fnv1aByte(hash, (uint8_t)field->scaleExponent);
+        hash = fnv1aByte(hash, field->flags);
+        hash = fnv1aByte(hash, field->flags >> 8);
+        hash = fnv1aByte(hash, field->maximumRateHz);
+        hash = fnv1aByte(hash, field->maximumRateHz >> 8);
+        hash = fnv1aByte(hash, field->nativeRateHz);
+        hash = fnv1aByte(hash, field->nativeRateHz >> 8);
+        hash = fnv1aByte(hash, field->instanceCount);
+        const uint8_t nameLength = strlen(field->name);
+        hash = fnv1aByte(hash, nameLength);
+        for (unsigned nameIndex = 0; nameIndex < nameLength; ++nameIndex) {
+            hash = fnv1aByte(hash, field->name[nameIndex]);
+        }
+    }
+
+    /* Zero is reserved for an unavailable catalogue. */
+    ghostCatalogHash = hash != 0 ? hash : 1;
+    return ghostCatalogHash;
+}
 
 static void mspGhostDpInitSession(void)
 {
@@ -75,17 +194,19 @@ static void mspGhostDpWriteHeader(sbuf_t *dst, uint8_t messageType,
     sbufWriteU16(dst, exchangeId);
 }
 
+static uint8_t responseFlags(mspGhostDpStatus_e status)
+{
+    return MSP_GHOST_DP_FLAG_RESPONSE |
+        (status == MSP_GHOST_DP_STATUS_OK ? 0 : MSP_GHOST_DP_FLAG_ERROR);
+}
+
 static void mspGhostDpWriteHelloResponse(sbuf_t *dst,
     const mspGhostDpHeader_t *request, mspGhostDpStatus_e status)
 {
     mspGhostDpInitSession();
-
-    uint8_t flags = MSP_GHOST_DP_FLAG_RESPONSE;
-    if (status != MSP_GHOST_DP_STATUS_OK) {
-        flags |= MSP_GHOST_DP_FLAG_ERROR;
-    }
-    mspGhostDpWriteHeader(dst, MSP_GHOST_DP_HELLO_RESPONSE, flags,
-        request->source, ghostSessionId, request->exchangeId);
+    mspGhostDpWriteHeader(dst, MSP_GHOST_DP_HELLO_RESPONSE,
+        responseFlags(status), request->source, ghostSessionId,
+        request->exchangeId);
 
     sbufWriteU8(dst, status);
     sbufWriteU32(dst, ghostBootId);
@@ -96,13 +217,84 @@ static void mspGhostDpWriteHelloResponse(sbuf_t *dst,
     sbufWriteU32(dst, U_ID_2);
     sbufWriteU32(dst, 0);
 
-    /* Phase 1 implements discovery only. */
-    sbufWriteU32(dst, 0);                    // catalog_hash
-    sbufWriteU32(dst, 0);                    // capability_flags
+    sbufWriteU32(dst, mspGhostDpCatalogHash());
+    sbufWriteU32(dst, 1u << 0);              // Field catalogue capability
     sbufWriteU16(dst, MSP_PORT_INBUF_SIZE);  // max_payload
     sbufWriteU32(dst, 0);                    // max_stream_bps
     sbufWriteU8(dst, 0);                     // max_slots
     sbufWriteU8(dst, 0);                     // lease_seconds
+}
+
+static void mspGhostDpWriteFieldRecord(sbuf_t *dst,
+    const mspGhostDpFieldDescriptor_t *field)
+{
+    const uint8_t nameLength = strlen(field->name);
+    sbufWriteU8(dst, 13 + nameLength); // Bytes following record_length.
+    sbufWriteU16(dst, field->id);
+    sbufWriteU8(dst, field->valueType);
+    sbufWriteU8(dst, field->unit);
+    sbufWriteU8(dst, (uint8_t)field->scaleExponent);
+    sbufWriteU16(dst, field->flags);
+    sbufWriteU16(dst, field->maximumRateHz);
+    sbufWriteU16(dst, field->nativeRateHz);
+    sbufWriteU8(dst, field->instanceCount);
+    sbufWriteU8(dst, nameLength);
+    sbufWriteData(dst, field->name, nameLength);
+}
+
+static void mspGhostDpWriteCatalogResponse(sbuf_t *dst,
+    const mspGhostDpHeader_t *request, mspGhostDpStatus_e status,
+    uint16_t startFieldId, uint8_t maximumRecords)
+{
+    mspGhostDpWriteHeader(dst, MSP_GHOST_DP_FIELD_CATALOG_RESPONSE,
+        responseFlags(status), request->source, ghostSessionId,
+        request->exchangeId);
+    sbufWriteU8(dst, status);
+    sbufWriteU32(dst, mspGhostDpCatalogHash());
+
+    uint8_t *nextFieldIdPtr = sbufPtr(dst);
+    sbufWriteU16(dst, 0);
+    uint8_t *recordCountPtr = sbufPtr(dst);
+    sbufWriteU8(dst, 0);
+
+    if (status != MSP_GHOST_DP_STATUS_OK) {
+        return;
+    }
+
+    unsigned index = 0;
+    const unsigned catalogSize = sizeof(fieldCatalog) / sizeof(fieldCatalog[0]);
+    while (index < catalogSize && fieldCatalog[index].id < startFieldId) {
+        ++index;
+    }
+
+    unsigned payloadLength = MSP_GHOST_DP_HEADER_SIZE + 8;
+    uint8_t recordCount = 0;
+    while (index < catalogSize && recordCount < maximumRecords) {
+        const mspGhostDpFieldDescriptor_t *field = &fieldCatalog[index];
+        const unsigned wireLength = 1 + 13 + strlen(field->name);
+        if (payloadLength + wireLength > MSP_GHOST_DP_NEGOTIATION_PAYLOAD_MAX) {
+            break;
+        }
+        mspGhostDpWriteFieldRecord(dst, field);
+        payloadLength += wireLength;
+        ++recordCount;
+        ++index;
+    }
+
+    *recordCountPtr = recordCount;
+    if (index < catalogSize) {
+        const uint16_t nextFieldId = fieldCatalog[index].id;
+        nextFieldIdPtr[0] = nextFieldId;
+        nextFieldIdPtr[1] = nextFieldId >> 8;
+    }
+}
+
+static bool mspGhostDpHeaderIsRequest(const mspGhostDpHeader_t *request)
+{
+    return (request->flags & MSP_GHOST_DP_FLAG_REQUEST) &&
+        !(request->flags & MSP_GHOST_DP_FLAG_RESPONSE) &&
+        (request->destination == MSP_GHOST_DP_ENDPOINT_FLIGHT_CONTROLLER ||
+         request->destination == MSP_GHOST_DP_ENDPOINT_BROADCAST);
 }
 
 mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
@@ -111,7 +303,6 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
     if (payloadLength == 0 || sbufReadU8(src) != MSP_DP_GHOST) {
         return MSP_RESULT_CMD_UNKNOWN;
     }
-
     if (payloadLength < MSP_GHOST_DP_HEADER_SIZE) {
         return MSP_RESULT_ERROR;
     }
@@ -125,24 +316,49 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
         .sessionId = sbufReadU16(src),
         .exchangeId = sbufReadU16(src),
     };
-
-    if (request.messageType != MSP_GHOST_DP_HELLO_REQUEST ||
-        !(request.flags & MSP_GHOST_DP_FLAG_REQUEST) ||
-        (request.flags & MSP_GHOST_DP_FLAG_RESPONSE) ||
-        (request.destination != MSP_GHOST_DP_ENDPOINT_FLIGHT_CONTROLLER &&
-         request.destination != MSP_GHOST_DP_ENDPOINT_BROADCAST)) {
+    if (!mspGhostDpHeaderIsRequest(&request)) {
         return MSP_RESULT_ERROR;
     }
 
-    mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
-    if ((request.version >> 4) != (MSP_GHOST_DP_VERSION_1_0 >> 4)) {
-        status = MSP_GHOST_DP_STATUS_UNSUPPORTED_VERSION;
-    } else if (sbufBytesRemaining(src) != 0) {
-        status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+    const bool versionSupported =
+        (request.version >> 4) == (MSP_GHOST_DP_VERSION_1_0 >> 4);
+    switch (request.messageType) {
+    case MSP_GHOST_DP_HELLO_REQUEST: {
+        mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
+        if (!versionSupported) {
+            status = MSP_GHOST_DP_STATUS_UNSUPPORTED_VERSION;
+        } else if (sbufBytesRemaining(src) != 0) {
+            status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        }
+        mspGhostDpWriteHelloResponse(dst, &request, status);
+        return MSP_RESULT_ACK;
     }
 
-    mspGhostDpWriteHelloResponse(dst, &request, status);
-    return MSP_RESULT_ACK;
+    case MSP_GHOST_DP_FIELD_CATALOG_REQUEST: {
+        mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
+        uint16_t startFieldId = 0;
+        uint8_t maximumRecords = 0;
+        if (!versionSupported) {
+            status = MSP_GHOST_DP_STATUS_UNSUPPORTED_VERSION;
+        } else if (ghostSessionId == 0 || request.sessionId != ghostSessionId) {
+            status = MSP_GHOST_DP_STATUS_INVALID_SESSION;
+        } else if (sbufBytesRemaining(src) != 3) {
+            status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        } else {
+            startFieldId = sbufReadU16(src);
+            maximumRecords = sbufReadU8(src);
+            if (maximumRecords == 0) {
+                status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+            }
+        }
+        mspGhostDpWriteCatalogResponse(dst, &request, status,
+            startFieldId, maximumRecords);
+        return MSP_RESULT_ACK;
+    }
+
+    default:
+        return MSP_RESULT_ERROR;
+    }
 }
 
 #endif // USE_MSP_DISPLAYPORT
