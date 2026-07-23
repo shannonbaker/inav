@@ -15,9 +15,15 @@
 
 #ifdef USE_MSP_DISPLAYPORT
 
+#include "common/time.h"
+
 #include "drivers/system.h"
+#include "drivers/time.h"
+
+#include "io/displayport_msp.h"
 
 #include "msp/msp_ghost_dp.h"
+#include "msp/msp_protocol.h"
 #include "msp/msp_serial.h"
 
 typedef struct mspGhostDpHeader_s {
@@ -41,6 +47,68 @@ typedef struct mspGhostDpFieldDescriptor_s {
     uint8_t instanceCount;
     const char *name;
 } mspGhostDpFieldDescriptor_t;
+
+enum {
+    MSP_GHOST_DP_MAX_SLOTS = 16,
+    MSP_GHOST_DP_MAX_STREAM_BPS = 40000,
+    MSP_GHOST_DP_DEFAULT_LEASE_SECONDS = 5,
+    MSP_GHOST_DP_MIN_LEASE_SECONDS = 2,
+    MSP_GHOST_DP_MAX_LEASE_SECONDS = 30,
+    MSP_GHOST_DP_QUOTE_LIFETIME_MS = 5000,
+};
+
+typedef struct mspGhostDpQuoteEntry_s {
+    uint8_t requestIndex;
+    uint8_t instance;
+    uint8_t priority;
+    uint8_t requestFlags;
+    mspGhostDpStatus_e status;
+    uint16_t offeredRateHz;
+    const mspGhostDpFieldDescriptor_t *field;
+} mspGhostDpQuoteEntry_t;
+
+typedef struct mspGhostDpQuote_s {
+    bool valid;
+    uint16_t sessionId;
+    uint16_t requestRevision;
+    uint32_t token;
+    uint32_t expiresAtMs;
+    uint32_t estimatedBps;
+    uint8_t leaseSeconds;
+    uint8_t entryCount;
+    mspGhostDpStatus_e status;
+    mspGhostDpQuoteEntry_t entries[MSP_GHOST_DP_MAX_SLOTS];
+} mspGhostDpQuote_t;
+
+typedef struct mspGhostDpStreamEntry_s {
+    uint8_t slot;
+    uint8_t instance;
+    uint16_t effectiveRateHz;
+    const mspGhostDpFieldDescriptor_t *field;
+} mspGhostDpStreamEntry_t;
+
+typedef struct mspGhostDpStream_s {
+    bool active;
+    uint16_t generation;
+    uint32_t expiresAtMs;
+    uint32_t effectiveBps;
+    uint32_t committedToken;
+    uint16_t committedRevision;
+    uint8_t leaseSeconds;
+    uint8_t entryCount;
+    mspGhostDpStreamEntry_t entries[MSP_GHOST_DP_MAX_SLOTS];
+} mspGhostDpStream_t;
+
+typedef struct mspGhostDpMutationCache_s {
+    bool valid;
+    uint8_t messageType;
+    uint16_t sessionId;
+    uint16_t exchangeId;
+    mspGhostDpStatus_e status;
+    uint16_t generation;
+    uint8_t leaseSeconds;
+    uint32_t effectiveBps;
+} mspGhostDpMutationCache_t;
 
 #define FIELD_SIGNED MSP_GHOST_DP_FIELD_SIGNED
 #define FIELD_INVALID MSP_GHOST_DP_FIELD_TEMPORARILY_INVALID
@@ -112,6 +180,12 @@ static const mspGhostDpFieldDescriptor_t fieldCatalog[] = {
 static uint32_t ghostBootId;
 static uint16_t ghostSessionId;
 static uint32_t ghostCatalogHash;
+static mspGhostDpQuote_t ghostQuote;
+static mspGhostDpStream_t ghostStream;
+static mspGhostDpMutationCache_t ghostMutationCache;
+static bool ghostStreamMapPending;
+static uint16_t ghostStreamMapExchangeId;
+static uint16_t ghostPushExchangeId;
 
 static uint32_t fnv1aByte(uint32_t hash, uint8_t value)
 {
@@ -149,6 +223,106 @@ static uint32_t mspGhostDpCatalogHash(void)
     /* Zero is reserved for an unavailable catalogue. */
     ghostCatalogHash = hash != 0 ? hash : 1;
     return ghostCatalogHash;
+}
+
+static const mspGhostDpFieldDescriptor_t *mspGhostDpFindField(uint16_t fieldId)
+{
+    for (unsigned index = 0; index < sizeof(fieldCatalog) / sizeof(fieldCatalog[0]); ++index) {
+        if (fieldCatalog[index].id == fieldId) {
+            return &fieldCatalog[index];
+        }
+    }
+    return NULL;
+}
+
+static uint8_t mspGhostDpValueSize(uint8_t valueType)
+{
+    switch (valueType) {
+    case MSP_GHOST_DP_VALUE_U8:
+    case MSP_GHOST_DP_VALUE_I8:
+    case MSP_GHOST_DP_VALUE_BOOL:
+        return 1;
+    case MSP_GHOST_DP_VALUE_U16:
+    case MSP_GHOST_DP_VALUE_I16:
+        return 2;
+    case MSP_GHOST_DP_VALUE_U32:
+    case MSP_GHOST_DP_VALUE_I32:
+    case MSP_GHOST_DP_VALUE_F32:
+        return 4;
+    case MSP_GHOST_DP_VALUE_U64:
+    case MSP_GHOST_DP_VALUE_I64:
+    case MSP_GHOST_DP_VALUE_F64:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t mspGhostDpEstimateFieldBps(
+    const mspGhostDpFieldDescriptor_t *field, uint16_t rateHz)
+{
+    /*
+     * Conservative upper bound: one complete native MSPv2 FIELD_DATA packet
+     * per field update, without relying on future batching.
+     */
+    const uint32_t bytesPerPacket = 9 + MSP_GHOST_DP_HEADER_SIZE + 3 + 3 +
+        mspGhostDpValueSize(field->valueType);
+    return bytesPerPacket * 8u * rateHz;
+}
+
+static uint8_t mspGhostDpClampLease(uint8_t requested)
+{
+    if (requested == 0) {
+        return MSP_GHOST_DP_DEFAULT_LEASE_SECONDS;
+    }
+    if (requested < MSP_GHOST_DP_MIN_LEASE_SECONDS) {
+        return MSP_GHOST_DP_MIN_LEASE_SECONDS;
+    }
+    if (requested > MSP_GHOST_DP_MAX_LEASE_SECONDS) {
+        return MSP_GHOST_DP_MAX_LEASE_SECONDS;
+    }
+    return requested;
+}
+
+static uint16_t mspGhostDpNextGeneration(void)
+{
+    ++ghostStream.generation;
+    if (ghostStream.generation == 0) {
+        ghostStream.generation = 1;
+    }
+    return ghostStream.generation;
+}
+
+static uint16_t mspGhostDpNextPushExchange(void)
+{
+    ++ghostPushExchangeId;
+    if (ghostPushExchangeId == 0) {
+        ghostPushExchangeId = 1;
+    }
+    return ghostPushExchangeId;
+}
+
+static void mspGhostDpScheduleStreamMap(uint16_t exchangeId)
+{
+    ghostStreamMapPending = true;
+    ghostStreamMapExchangeId = exchangeId != 0 ? exchangeId :
+        mspGhostDpNextPushExchange();
+}
+
+static void mspGhostDpExpireStream(uint32_t nowMs)
+{
+    if (!ghostStream.active || cmp32(nowMs, ghostStream.expiresAtMs) < 0) {
+        return;
+    }
+    ghostStream.active = false;
+    ghostStream.entryCount = 0;
+    ghostStream.leaseSeconds = 0;
+    ghostStream.effectiveBps = 0;
+    ghostStream.committedToken = 0;
+    ghostStream.committedRevision = 0;
+    ghostMutationCache.valid = false;
+    mspGhostDpNextGeneration();
+    mspGhostDpScheduleStreamMap(0);
 }
 
 static void mspGhostDpInitSession(void)
@@ -218,11 +392,11 @@ static void mspGhostDpWriteHelloResponse(sbuf_t *dst,
     sbufWriteU32(dst, 0);
 
     sbufWriteU32(dst, mspGhostDpCatalogHash());
-    sbufWriteU32(dst, 1u << 0);              // Field catalogue capability
+    sbufWriteU32(dst, (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4));
     sbufWriteU16(dst, MSP_PORT_INBUF_SIZE);  // max_payload
-    sbufWriteU32(dst, 0);                    // max_stream_bps
-    sbufWriteU8(dst, 0);                     // max_slots
-    sbufWriteU8(dst, 0);                     // lease_seconds
+    sbufWriteU32(dst, MSP_GHOST_DP_MAX_STREAM_BPS);
+    sbufWriteU8(dst, MSP_GHOST_DP_MAX_SLOTS);
+    sbufWriteU8(dst, MSP_GHOST_DP_DEFAULT_LEASE_SECONDS);
 }
 
 static void mspGhostDpWriteFieldRecord(sbuf_t *dst,
@@ -289,6 +463,296 @@ static void mspGhostDpWriteCatalogResponse(sbuf_t *dst,
     }
 }
 
+static uint32_t mspGhostDpQuoteToken(const mspGhostDpQuote_t *quote,
+    uint16_t exchangeId)
+{
+    uint32_t hash = 2166136261u;
+    hash = fnv1aByte(hash, ghostSessionId);
+    hash = fnv1aByte(hash, ghostSessionId >> 8);
+    hash = fnv1aByte(hash, quote->requestRevision);
+    hash = fnv1aByte(hash, quote->requestRevision >> 8);
+    hash = fnv1aByte(hash, exchangeId);
+    hash = fnv1aByte(hash, exchangeId >> 8);
+    hash = fnv1aByte(hash, quote->leaseSeconds);
+    for (unsigned index = 0; index < quote->entryCount; ++index) {
+        const mspGhostDpQuoteEntry_t *entry = &quote->entries[index];
+        hash = fnv1aByte(hash, entry->requestIndex);
+        hash = fnv1aByte(hash, entry->field ? entry->field->id : 0);
+        hash = fnv1aByte(hash, entry->field ? entry->field->id >> 8 : 0);
+        hash = fnv1aByte(hash, entry->instance);
+        hash = fnv1aByte(hash, entry->offeredRateHz);
+        hash = fnv1aByte(hash, entry->offeredRateHz >> 8);
+        hash = fnv1aByte(hash, entry->status);
+    }
+    return hash != 0 ? hash : 1;
+}
+
+static bool mspGhostDpQuoteHasDuplicate(unsigned currentIndex)
+{
+    const mspGhostDpQuoteEntry_t *current = &ghostQuote.entries[currentIndex];
+    if (!current->field) {
+        return false;
+    }
+    for (unsigned index = 0; index < currentIndex; ++index) {
+        const mspGhostDpQuoteEntry_t *other = &ghostQuote.entries[index];
+        if (other->field == current->field && other->instance == current->instance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mspGhostDpQuoteEntryAccepted(const mspGhostDpQuoteEntry_t *entry)
+{
+    return (entry->status == MSP_GHOST_DP_STATUS_OK ||
+            entry->status == MSP_GHOST_DP_STATUS_RATE_LIMITED) &&
+        entry->offeredRateHz != 0;
+}
+
+static void mspGhostDpAdmitQuoteEntries(bool required)
+{
+    bool considered[MSP_GHOST_DP_MAX_SLOTS] = { false };
+    for (unsigned count = 0; count < ghostQuote.entryCount; ++count) {
+        int selected = -1;
+        for (unsigned index = 0; index < ghostQuote.entryCount; ++index) {
+            const mspGhostDpQuoteEntry_t *entry = &ghostQuote.entries[index];
+            const bool isRequired = (entry->requestFlags & 1u) != 0;
+            if (considered[index] || isRequired != required ||
+                !mspGhostDpQuoteEntryAccepted(entry)) {
+                continue;
+            }
+            if (selected < 0 ||
+                entry->priority < ghostQuote.entries[selected].priority) {
+                selected = index;
+            }
+        }
+        if (selected < 0) {
+            break;
+        }
+        considered[selected] = true;
+        mspGhostDpQuoteEntry_t *entry = &ghostQuote.entries[selected];
+        const uint32_t entryBps = mspGhostDpEstimateFieldBps(
+            entry->field, entry->offeredRateHz);
+        if (entryBps > MSP_GHOST_DP_MAX_STREAM_BPS - ghostQuote.estimatedBps) {
+            entry->status = MSP_GHOST_DP_STATUS_BANDWIDTH_EXCEEDED;
+            entry->offeredRateHz = 0;
+            if (required && ghostQuote.status == MSP_GHOST_DP_STATUS_OK) {
+                ghostQuote.status = MSP_GHOST_DP_STATUS_BANDWIDTH_EXCEEDED;
+            }
+        } else {
+            ghostQuote.estimatedBps += entryBps;
+        }
+    }
+}
+
+static void mspGhostDpReadQuote(sbuf_t *src, const mspGhostDpHeader_t *request,
+    mspGhostDpStatus_e initialStatus)
+{
+    memset(&ghostQuote, 0, sizeof(ghostQuote));
+    ghostQuote.sessionId = ghostSessionId;
+    ghostQuote.status = initialStatus;
+
+    if (initialStatus != MSP_GHOST_DP_STATUS_OK) {
+        return;
+    }
+    if (sbufBytesRemaining(src) < 4) {
+        ghostQuote.status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        return;
+    }
+
+    ghostQuote.requestRevision = sbufReadU16(src);
+    ghostQuote.leaseSeconds = mspGhostDpClampLease(sbufReadU8(src));
+    ghostQuote.entryCount = sbufReadU8(src);
+    if (ghostQuote.entryCount == 0) {
+        ghostQuote.entryCount = 0;
+        ghostQuote.status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        return;
+    }
+    if (ghostQuote.entryCount > MSP_GHOST_DP_MAX_SLOTS) {
+        ghostQuote.entryCount = 0;
+        ghostQuote.status = MSP_GHOST_DP_STATUS_TOO_MANY_FIELDS;
+        return;
+    }
+    if ((unsigned)sbufBytesRemaining(src) != ghostQuote.entryCount * 10u) {
+        ghostQuote.entryCount = 0;
+        ghostQuote.status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        return;
+    }
+
+    for (unsigned index = 0; index < ghostQuote.entryCount; ++index) {
+        mspGhostDpQuoteEntry_t *entry = &ghostQuote.entries[index];
+        entry->requestIndex = sbufReadU8(src);
+        const uint16_t fieldId = sbufReadU16(src);
+        entry->instance = sbufReadU8(src);
+        const uint16_t minimumRateHz = sbufReadU16(src);
+        const uint16_t preferredRateHz = sbufReadU16(src);
+        entry->priority = sbufReadU8(src);
+        entry->requestFlags = sbufReadU8(src);
+        entry->field = mspGhostDpFindField(fieldId);
+        entry->status = MSP_GHOST_DP_STATUS_OK;
+
+        const bool required = (entry->requestFlags & 1u) != 0;
+        const bool optional = (entry->requestFlags & 2u) != 0;
+        if ((entry->requestFlags & ~3u) || required == optional) {
+            entry->status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+        } else if (!entry->field) {
+            entry->status = MSP_GHOST_DP_STATUS_UNSUPPORTED_FIELD;
+        } else if (entry->instance != 0) {
+            entry->status = MSP_GHOST_DP_STATUS_INVALID_INSTANCE;
+        } else if (minimumRateHz == 0 || preferredRateHz < minimumRateHz ||
+                   minimumRateHz > entry->field->maximumRateHz) {
+            entry->status = MSP_GHOST_DP_STATUS_INVALID_RATE;
+        } else {
+            entry->offeredRateHz = preferredRateHz;
+            if (entry->offeredRateHz > entry->field->maximumRateHz) {
+                entry->offeredRateHz = entry->field->maximumRateHz;
+                entry->status = MSP_GHOST_DP_STATUS_RATE_LIMITED;
+            }
+        }
+
+        if (mspGhostDpQuoteHasDuplicate(index)) {
+            entry->status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+            entry->offeredRateHz = 0;
+        }
+        if (entry->status != MSP_GHOST_DP_STATUS_OK &&
+            entry->status != MSP_GHOST_DP_STATUS_RATE_LIMITED && required &&
+            ghostQuote.status == MSP_GHOST_DP_STATUS_OK) {
+            ghostQuote.status = entry->status;
+        }
+    }
+
+    mspGhostDpAdmitQuoteEntries(true);
+    mspGhostDpAdmitQuoteEntries(false);
+
+    if (ghostQuote.status == MSP_GHOST_DP_STATUS_OK) {
+        ghostQuote.token = mspGhostDpQuoteToken(&ghostQuote,
+            request->exchangeId);
+        ghostQuote.expiresAtMs = millis() + MSP_GHOST_DP_QUOTE_LIFETIME_MS;
+        ghostQuote.valid = true;
+    }
+}
+
+static void mspGhostDpWriteQuoteResponse(sbuf_t *dst,
+    const mspGhostDpHeader_t *request)
+{
+    mspGhostDpWriteHeader(dst, MSP_GHOST_DP_SUBSCRIPTION_QUOTE_RESULT,
+        responseFlags(ghostQuote.status), request->source, ghostSessionId,
+        request->exchangeId);
+    sbufWriteU8(dst, ghostQuote.status);
+    sbufWriteU16(dst, ghostQuote.requestRevision);
+    sbufWriteU32(dst, ghostQuote.valid ? ghostQuote.token : 0);
+    sbufWriteU32(dst, ghostQuote.estimatedBps);
+    sbufWriteU8(dst, ghostQuote.leaseSeconds);
+    sbufWriteU8(dst, ghostQuote.entryCount);
+    for (unsigned index = 0; index < ghostQuote.entryCount; ++index) {
+        const mspGhostDpQuoteEntry_t *entry = &ghostQuote.entries[index];
+        sbufWriteU8(dst, entry->requestIndex);
+        sbufWriteU8(dst, entry->status);
+        sbufWriteU16(dst, entry->offeredRateHz);
+    }
+}
+
+static void mspGhostDpWriteSubscriptionResult(sbuf_t *dst,
+    const mspGhostDpHeader_t *request, mspGhostDpStatus_e status,
+    uint16_t generation, uint8_t leaseSeconds, uint32_t effectiveBps)
+{
+    mspGhostDpWriteHeader(dst, MSP_GHOST_DP_SUBSCRIPTION_RESULT,
+        responseFlags(status), request->source, ghostSessionId,
+        request->exchangeId);
+    sbufWriteU8(dst, status);
+    sbufWriteU16(dst, generation);
+    sbufWriteU8(dst, leaseSeconds);
+    sbufWriteU32(dst, effectiveBps);
+}
+
+static bool mspGhostDpWriteCachedMutation(sbuf_t *dst,
+    const mspGhostDpHeader_t *request)
+{
+    if (!ghostMutationCache.valid ||
+        ghostMutationCache.messageType != request->messageType ||
+        ghostMutationCache.sessionId != request->sessionId ||
+        ghostMutationCache.exchangeId != request->exchangeId) {
+        return false;
+    }
+    mspGhostDpWriteSubscriptionResult(dst, request, ghostMutationCache.status,
+        ghostMutationCache.generation, ghostMutationCache.leaseSeconds,
+        ghostMutationCache.effectiveBps);
+    if (ghostMutationCache.status == MSP_GHOST_DP_STATUS_OK &&
+        (request->messageType == MSP_GHOST_DP_SUBSCRIPTION_COMMIT ||
+         request->messageType == MSP_GHOST_DP_SUBSCRIPTION_RELEASE)) {
+        mspGhostDpScheduleStreamMap(request->exchangeId);
+    }
+    return true;
+}
+
+static void mspGhostDpCacheMutation(const mspGhostDpHeader_t *request,
+    mspGhostDpStatus_e status, uint16_t generation, uint8_t leaseSeconds,
+    uint32_t effectiveBps)
+{
+    ghostMutationCache = (mspGhostDpMutationCache_t) {
+        .valid = true,
+        .messageType = request->messageType,
+        .sessionId = request->sessionId,
+        .exchangeId = request->exchangeId,
+        .status = status,
+        .generation = generation,
+        .leaseSeconds = leaseSeconds,
+        .effectiveBps = effectiveBps,
+    };
+}
+
+static void mspGhostDpApplyQuote(uint32_t nowMs)
+{
+    ghostStream.active = true;
+    ghostStream.entryCount = 0;
+    ghostStream.leaseSeconds = ghostQuote.leaseSeconds;
+    ghostStream.effectiveBps = ghostQuote.estimatedBps;
+    ghostStream.committedToken = ghostQuote.token;
+    ghostStream.committedRevision = ghostQuote.requestRevision;
+    ghostStream.expiresAtMs = nowMs + ghostStream.leaseSeconds * 1000u;
+    mspGhostDpNextGeneration();
+    for (unsigned index = 0; index < ghostQuote.entryCount; ++index) {
+        const mspGhostDpQuoteEntry_t *quoted = &ghostQuote.entries[index];
+        if (!mspGhostDpQuoteEntryAccepted(quoted)) {
+            continue;
+        }
+        mspGhostDpStreamEntry_t *stream =
+            &ghostStream.entries[ghostStream.entryCount];
+        stream->slot = ghostStream.entryCount;
+        stream->instance = quoted->instance;
+        stream->effectiveRateHz = quoted->offeredRateHz;
+        stream->field = quoted->field;
+        ++ghostStream.entryCount;
+    }
+    ghostQuote.valid = false;
+}
+
+static int mspGhostDpPushStreamMap(void)
+{
+    uint8_t payload[MSP_GHOST_DP_HEADER_SIZE + 5 +
+        MSP_GHOST_DP_MAX_SLOTS * 9];
+    sbuf_t dst = { .ptr = payload, .end = payload + sizeof(payload) };
+    mspGhostDpWriteHeader(&dst, MSP_GHOST_DP_STREAM_MAP, 0,
+        MSP_GHOST_DP_ENDPOINT_VRX, ghostSessionId, ghostStreamMapExchangeId);
+    sbufWriteU16(&dst, ghostStream.generation);
+    sbufWriteU8(&dst, 0); // fragment_index
+    sbufWriteU8(&dst, 1); // fragment_count
+    sbufWriteU8(&dst, ghostStream.entryCount);
+    for (unsigned index = 0; index < ghostStream.entryCount; ++index) {
+        const mspGhostDpStreamEntry_t *entry = &ghostStream.entries[index];
+        sbufWriteU8(&dst, entry->slot);
+        sbufWriteU16(&dst, entry->field->id);
+        sbufWriteU8(&dst, entry->instance);
+        sbufWriteU8(&dst, entry->field->valueType);
+        sbufWriteU8(&dst, entry->field->unit);
+        sbufWriteU8(&dst, (uint8_t)entry->field->scaleExponent);
+        sbufWriteU16(&dst, entry->effectiveRateHz);
+    }
+    const int payloadLength = sbufPtr(&dst) - payload;
+    return mspSerialPush(displayPortMspGetSerial(), MSP_DISPLAYPORT, payload,
+        payloadLength, MSP_DIRECTION_REPLY, MSP_V2_NATIVE);
+}
+
 static bool mspGhostDpHeaderIsRequest(const mspGhostDpHeader_t *request)
 {
     return (request->flags & MSP_GHOST_DP_FLAG_REQUEST) &&
@@ -322,6 +786,7 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
 
     const bool versionSupported =
         (request.version >> 4) == (MSP_GHOST_DP_VERSION_1_0 >> 4);
+    mspGhostDpExpireStream(millis());
     switch (request.messageType) {
     case MSP_GHOST_DP_HELLO_REQUEST: {
         mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
@@ -356,8 +821,139 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
         return MSP_RESULT_ACK;
     }
 
+    case MSP_GHOST_DP_SUBSCRIPTION_QUOTE: {
+        mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
+        if (!versionSupported) {
+            status = MSP_GHOST_DP_STATUS_UNSUPPORTED_VERSION;
+        } else if (ghostSessionId == 0 || request.sessionId != ghostSessionId) {
+            status = MSP_GHOST_DP_STATUS_INVALID_SESSION;
+        } else if (!(request.flags & MSP_GHOST_DP_FLAG_VOLATILE)) {
+            status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+        }
+        mspGhostDpReadQuote(src, &request, status);
+        mspGhostDpWriteQuoteResponse(dst, &request);
+        return MSP_RESULT_ACK;
+    }
+
+    case MSP_GHOST_DP_SUBSCRIPTION_COMMIT: {
+        if (mspGhostDpWriteCachedMutation(dst, &request)) {
+            return MSP_RESULT_ACK;
+        }
+        mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
+        uint16_t requestRevision = 0;
+        uint32_t quoteToken = 0;
+        const uint32_t nowMs = millis();
+        if (!versionSupported) {
+            status = MSP_GHOST_DP_STATUS_UNSUPPORTED_VERSION;
+        } else if (ghostSessionId == 0 || request.sessionId != ghostSessionId) {
+            status = MSP_GHOST_DP_STATUS_INVALID_SESSION;
+        } else if (!(request.flags & MSP_GHOST_DP_FLAG_VOLATILE)) {
+            status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+        } else if (sbufBytesRemaining(src) != 6) {
+            status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        } else {
+            requestRevision = sbufReadU16(src);
+            quoteToken = sbufReadU32(src);
+            if (!ghostQuote.valid || cmp32(nowMs, ghostQuote.expiresAtMs) >= 0 ||
+                ghostQuote.sessionId != request.sessionId ||
+                ghostQuote.requestRevision != requestRevision ||
+                ghostQuote.token != quoteToken) {
+                status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+            }
+        }
+        if (status == MSP_GHOST_DP_STATUS_OK) {
+            mspGhostDpApplyQuote(nowMs);
+            mspGhostDpScheduleStreamMap(request.exchangeId);
+        }
+        mspGhostDpWriteSubscriptionResult(dst, &request, status,
+            ghostStream.generation,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.leaseSeconds : 0,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.effectiveBps : 0);
+        mspGhostDpCacheMutation(&request, status, ghostStream.generation,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.leaseSeconds : 0,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.effectiveBps : 0);
+        return MSP_RESULT_ACK;
+    }
+
+    case MSP_GHOST_DP_SUBSCRIPTION_RENEW: {
+        if (mspGhostDpWriteCachedMutation(dst, &request)) {
+            return MSP_RESULT_ACK;
+        }
+        mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
+        uint16_t generation = 0;
+        if (!versionSupported) {
+            status = MSP_GHOST_DP_STATUS_UNSUPPORTED_VERSION;
+        } else if (ghostSessionId == 0 || request.sessionId != ghostSessionId) {
+            status = MSP_GHOST_DP_STATUS_INVALID_SESSION;
+        } else if (!(request.flags & MSP_GHOST_DP_FLAG_VOLATILE)) {
+            status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+        } else if (sbufBytesRemaining(src) != 2) {
+            status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        } else {
+            generation = sbufReadU16(src);
+            if (!ghostStream.active || generation != ghostStream.generation) {
+                status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+            }
+        }
+        if (status == MSP_GHOST_DP_STATUS_OK) {
+            ghostStream.expiresAtMs = millis() + ghostStream.leaseSeconds * 1000u;
+        }
+        mspGhostDpWriteSubscriptionResult(dst, &request, status,
+            ghostStream.generation,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.leaseSeconds : 0,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.effectiveBps : 0);
+        mspGhostDpCacheMutation(&request, status, ghostStream.generation,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.leaseSeconds : 0,
+            status == MSP_GHOST_DP_STATUS_OK ? ghostStream.effectiveBps : 0);
+        return MSP_RESULT_ACK;
+    }
+
+    case MSP_GHOST_DP_SUBSCRIPTION_RELEASE: {
+        if (mspGhostDpWriteCachedMutation(dst, &request)) {
+            return MSP_RESULT_ACK;
+        }
+        mspGhostDpStatus_e status = MSP_GHOST_DP_STATUS_OK;
+        uint16_t generation = 0;
+        if (!versionSupported) {
+            status = MSP_GHOST_DP_STATUS_UNSUPPORTED_VERSION;
+        } else if (ghostSessionId == 0 || request.sessionId != ghostSessionId) {
+            status = MSP_GHOST_DP_STATUS_INVALID_SESSION;
+        } else if (!(request.flags & MSP_GHOST_DP_FLAG_VOLATILE)) {
+            status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+        } else if (sbufBytesRemaining(src) != 2) {
+            status = MSP_GHOST_DP_STATUS_BAD_LENGTH;
+        } else {
+            generation = sbufReadU16(src);
+            if (!ghostStream.active || generation != ghostStream.generation) {
+                status = MSP_GHOST_DP_STATUS_INVALID_TRANSACTION;
+            }
+        }
+        if (status == MSP_GHOST_DP_STATUS_OK) {
+            ghostStream.active = false;
+            ghostStream.entryCount = 0;
+            ghostStream.leaseSeconds = 0;
+            ghostStream.effectiveBps = 0;
+            ghostStream.committedToken = 0;
+            ghostStream.committedRevision = 0;
+            mspGhostDpNextGeneration();
+            mspGhostDpScheduleStreamMap(request.exchangeId);
+        }
+        mspGhostDpWriteSubscriptionResult(dst, &request, status,
+            ghostStream.generation, 0, 0);
+        mspGhostDpCacheMutation(&request, status, ghostStream.generation, 0, 0);
+        return MSP_RESULT_ACK;
+    }
+
     default:
         return MSP_RESULT_ERROR;
+    }
+}
+
+void mspGhostDpProcess(void)
+{
+    mspGhostDpExpireStream(millis());
+    if (ghostStreamMapPending && mspGhostDpPushStreamMap() > 0) {
+        ghostStreamMapPending = false;
     }
 }
 
