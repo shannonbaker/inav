@@ -77,6 +77,9 @@
 #include "io/adsb.h"
 
 #include "msp/msp_serial.h"
+#ifdef USE_MSP_GHOST_DP
+#include "msp/msp_ghost_dp.h"
+#endif
 
 #include "rx/rx.h"
 
@@ -113,6 +116,10 @@ void taskHandleSerial(timeUs_t currentTimeUs)
 
     // Allow MSP processing even if in CLI mode
     mspSerialProcess(ARMING_FLAG(ARMED) ? MSP_SKIP_NON_MSP_DATA : MSP_EVALUATE_NON_MSP_DATA, mspFcProcessCommand);
+
+#ifdef USE_MSP_GHOST_DP
+    mspGhostDpProcess();
+#endif
 
 #if defined(USE_DJI_HD_OSD)
     // DJI OSD uses a special flavour of MSP (subset of Betaflight 4.1.1 MSP) - process as part of serial task

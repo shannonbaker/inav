@@ -11,6 +11,11 @@ set(DOWNLOADS_DIR "${MAIN_DIR}/downloads")
 set(TOOLS_DIR "${MAIN_DIR}/tools")
 
 option(SITL "SITL build for host system" OFF)
+option(MSP_GHOST_DP "Enable native GHOST fields and missions over MSP DisplayPort" OFF)
+
+if (MSP_GHOST_DP)
+    add_compile_definitions(USE_MSP_GHOST_DP USE_MSP_DISPLAYPORT)
+endif()
 
 set(TOOLCHAIN_OPTIONS none arm-none-eabi host)
 if (SITL)

@@ -107,6 +107,9 @@
 #include "io/osd/custom_elements.h"
 
 #include "msp/msp.h"
+#ifdef USE_MSP_GHOST_DP
+#include "msp/msp_ghost_dp.h"
+#endif
 #include "msp/msp_protocol.h"
 #include "msp/msp_serial.h"
 #include "io/rangefinder.h"
@@ -5060,6 +5063,11 @@ mspResult_e mspFcProcessCommand(mspPacket_t *cmd, mspPacket_t *reply, mspPostPro
     // initialize reply by default
     reply->cmd = cmd->cmd;
 
+#ifdef USE_MSP_GHOST_DP
+    if (cmdMSP == MSP_DISPLAYPORT && sbufBytesRemaining(src) > 0 && sbufPtr(src)[0] == MSP_DP_GHOST) {
+        ret = mspGhostDpProcessCommand(src, dst);
+    } else
+#endif
     if (MSP2_IS_SENSOR_MESSAGE(cmdMSP)) {
         ret = mspProcessSensorCommand(cmdMSP, src);
     } else if (mspFcProcessOutCommand(cmdMSP, dst, mspPostProcessFn)) {

@@ -9,6 +9,8 @@
 
 #pragma once
 
+#ifdef USE_MSP_GHOST_DP
+
 #include "common/streambuf.h"
 #include "msp/msp.h"
 
@@ -36,6 +38,12 @@ typedef enum {
 } mspGhostDpFlag_e;
 
 typedef enum {
+    MSP_GHOST_DP_SUBSCRIPTION_REQUIRED = 1 << 0,
+    MSP_GHOST_DP_SUBSCRIPTION_OPTIONAL = 1 << 1,
+    MSP_GHOST_DP_SUBSCRIPTION_HAS_DEADBAND = 1 << 2,
+} mspGhostDpSubscriptionFlag_e;
+
+typedef enum {
     MSP_GHOST_DP_HELLO_REQUEST = 0x01,
     MSP_GHOST_DP_HELLO_RESPONSE = 0x02,
     MSP_GHOST_DP_FIELD_CATALOG_REQUEST = 0x03,
@@ -48,6 +56,10 @@ typedef enum {
     MSP_GHOST_DP_SUBSCRIPTION_RELEASE = 0x15,
     MSP_GHOST_DP_STREAM_MAP = 0x20,
     MSP_GHOST_DP_FIELD_DATA = 0x21,
+    MSP_GHOST_DP_MISSION_INFO_REQUEST = 0x30,
+    MSP_GHOST_DP_MISSION_INFO_RESPONSE = 0x31,
+    MSP_GHOST_DP_MISSION_ITEM_REQUEST = 0x32,
+    MSP_GHOST_DP_MISSION_ITEM_RESPONSE = 0x33,
 } mspGhostDpMessageType_e;
 
 typedef enum {
@@ -64,6 +76,7 @@ typedef enum {
     MSP_GHOST_DP_STATUS_BANDWIDTH_EXCEEDED = 12,
     MSP_GHOST_DP_STATUS_TOO_MANY_FIELDS = 13,
     MSP_GHOST_DP_STATUS_BUSY = 19,
+    MSP_GHOST_DP_STATUS_INVALID_MISSION = 22,
 } mspGhostDpStatus_e;
 
 typedef enum {
@@ -94,6 +107,8 @@ typedef enum {
     MSP_GHOST_DP_UNIT_PERCENT = 8,
     MSP_GHOST_DP_UNIT_HERTZ = 9,
     MSP_GHOST_DP_UNIT_COUNT = 10,
+    MSP_GHOST_DP_UNIT_DEGREES_PER_SECOND = 11,
+    MSP_GHOST_DP_UNIT_WATT_HOUR = 12,
 } mspGhostDpUnit_e;
 
 typedef enum {
@@ -106,3 +121,5 @@ typedef enum {
 
 mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst);
 void mspGhostDpProcess(void);
+
+#endif // USE_MSP_GHOST_DP
