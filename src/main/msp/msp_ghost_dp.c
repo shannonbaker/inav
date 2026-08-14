@@ -25,6 +25,7 @@
 
 #include "flight/imu.h"
 
+#include "io/displayport_msp_osd.h"
 #include "mavlink/mavlink_mission.h"
 #include "navigation/navigation.h"
 
@@ -51,6 +52,16 @@ typedef struct mspGhostDpHeader_s {
     uint16_t sessionId;
     uint16_t exchangeId;
 } mspGhostDpHeader_t;
+
+typedef struct mspGhostDpRelayMailbox_s {
+    uint16_t exchangeId;
+    uint16_t length;
+    bool waiting;
+    bool ready;
+    uint8_t payload[MSP_PORT_INBUF_SIZE];
+} mspGhostDpRelayMailbox_t;
+
+static mspGhostDpRelayMailbox_t ghostRelayMailbox;
 
 typedef struct mspGhostDpFieldDescriptor_s {
     uint16_t id;
@@ -1119,6 +1130,7 @@ static void mspGhostDpWriteFloat(sbuf_t *dst, float value)
 mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
 {
     const unsigned payloadLength = sbufBytesRemaining(src);
+    const uint8_t *const payload = sbufConstPtr(src);
     if (payloadLength == 0 || sbufReadU8(src) != MSP_DP_GHOST) {
         return MSP_RESULT_ERROR;
     }
@@ -1135,6 +1147,58 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
         .sessionId = sbufReadU16(src),
         .exchangeId = sbufReadU16(src),
     };
+    if ((request.flags & MSP_GHOST_DP_FLAG_RESPONSE) &&
+        request.source == MSP_GHOST_DP_ENDPOINT_VRX &&
+        request.destination == MSP_GHOST_DP_ENDPOINT_CONFIGURATOR) {
+        if (ghostRelayMailbox.waiting &&
+            request.exchangeId == ghostRelayMailbox.exchangeId &&
+            payloadLength <= sizeof(ghostRelayMailbox.payload)) {
+            memcpy(ghostRelayMailbox.payload, payload, payloadLength);
+            ghostRelayMailbox.length = payloadLength;
+            ghostRelayMailbox.ready = true;
+            ghostRelayMailbox.waiting = false;
+        }
+        return MSP_RESULT_NO_REPLY;
+    }
+    if ((request.flags & MSP_GHOST_DP_FLAG_REQUEST) &&
+        request.source == MSP_GHOST_DP_ENDPOINT_CONFIGURATOR &&
+        request.destination == MSP_GHOST_DP_ENDPOINT_VRX) {
+        mspPort_t *const osdPort = getMspOsdPort();
+        if (payloadLength > MSP_PORT_INBUF_SIZE || !osdPort) {
+            return MSP_RESULT_ERROR;
+        }
+        ghostRelayMailbox.exchangeId = request.exchangeId;
+        ghostRelayMailbox.length = 0;
+        ghostRelayMailbox.waiting = true;
+        ghostRelayMailbox.ready = false;
+        if (mspSerialPushPort(MSP_DISPLAYPORT, payload, payloadLength,
+                osdPort, MSP_V2_NATIVE) <= 0) {
+            ghostRelayMailbox.waiting = false;
+            return MSP_RESULT_ERROR;
+        }
+        sbufWriteU16(dst, request.exchangeId);
+        return MSP_RESULT_ACK;
+    }
+    if (request.messageType == MSP_GHOST_DP_RELAY_POLL &&
+        request.source == MSP_GHOST_DP_ENDPOINT_CONFIGURATOR &&
+        request.destination == MSP_GHOST_DP_ENDPOINT_FLIGHT_CONTROLLER &&
+        (request.flags & MSP_GHOST_DP_FLAG_REQUEST) &&
+        sbufBytesRemaining(src) == 2) {
+        const uint16_t exchangeId = sbufReadU16(src);
+        if (ghostRelayMailbox.ready &&
+            exchangeId == ghostRelayMailbox.exchangeId) {
+            sbufWriteData(dst, ghostRelayMailbox.payload,
+                ghostRelayMailbox.length);
+            ghostRelayMailbox.ready = false;
+        } else {
+            mspGhostDpWriteHeader(dst, MSP_GHOST_DP_RELAY_POLL_RESULT,
+                responseFlags(MSP_GHOST_DP_STATUS_BUSY),
+                MSP_GHOST_DP_ENDPOINT_CONFIGURATOR, request.sessionId,
+                request.exchangeId);
+            sbufWriteU16(dst, exchangeId);
+        }
+        return MSP_RESULT_ACK;
+    }
     if (!mspGhostDpHeaderIsRequest(&request)) {
         return MSP_RESULT_ERROR;
     }
