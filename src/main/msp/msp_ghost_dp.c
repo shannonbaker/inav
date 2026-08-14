@@ -834,8 +834,9 @@ static int mspGhostDpPushStreamMap(void)
         sbufWriteU16(&dst, entry->effectiveRateHz);
     }
     const int payloadLength = sbufPtr(&dst) - payload;
-    return mspSerialPushVersion(MSP_DISPLAYPORT, payload, payloadLength,
-        MSP_V2_NATIVE);
+    mspPort_t *const osdPort = getMspOsdPort();
+    return osdPort ? mspSerialPushPort(MSP_DISPLAYPORT, payload,
+        payloadLength, osdPort, MSP_V2_NATIVE) : 0;
 }
 
 enum {
@@ -1075,8 +1076,9 @@ static int mspGhostDpPushFieldData(uint32_t nowUs)
     }
 
     const int payloadLength = sbufPtr(&dst) - payload;
-    const int written = mspSerialPushVersion(MSP_DISPLAYPORT, payload,
-        payloadLength, MSP_V2_NATIVE);
+    mspPort_t *const osdPort = getMspOsdPort();
+    const int written = osdPort ? mspSerialPushPort(MSP_DISPLAYPORT, payload,
+        payloadLength, osdPort, MSP_V2_NATIVE) : 0;
     if (written <= 0) {
         return written;
     }
