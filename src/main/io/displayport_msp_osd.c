@@ -50,6 +50,9 @@
 #include "io/displayport_msp.h"
 
 #include "msp/msp_protocol.h"
+#ifdef USE_MSP_GHOST_DP
+#include "msp/msp_ghost_dp.h"
+#endif
 #include "msp/msp_serial.h"
 
 #include "displayport_msp_osd.h"
@@ -504,6 +507,12 @@ displayPort_t* mspOsdDisplayPortInit(const videoSystem_e videoSystem)
  */
 static mspResult_e processMspCommand(mspPacket_t *cmd, mspPacket_t *reply, mspPostProcessFnPtr *mspPostProcessFn)
 {
+#ifdef USE_MSP_GHOST_DP
+    if (cmd->cmd == MSP_DISPLAYPORT && mspGhostDpProcessReply(&cmd->buf)) {
+        return MSP_RESULT_NO_REPLY;
+    }
+#endif
+
     if ((vtxSeen && !vtxActive) || (cmd->cmd == MSP_EEPROM_WRITE)) {
         vtxReset = true;
     }

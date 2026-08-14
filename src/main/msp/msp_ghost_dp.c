@@ -1103,6 +1103,30 @@ static bool mspGhostDpHeaderIsRequest(const mspGhostDpHeader_t *request)
          request->destination == MSP_GHOST_DP_ENDPOINT_BROADCAST);
 }
 
+bool mspGhostDpProcessReply(sbuf_t *src)
+{
+    const unsigned payloadLength = sbufBytesRemaining(src);
+    const uint8_t *const payload = sbufConstPtr(src);
+    if (payloadLength < MSP_GHOST_DP_HEADER_SIZE ||
+        payload[0] != MSP_DP_GHOST ||
+        !(payload[3] & MSP_GHOST_DP_FLAG_RESPONSE) ||
+        payload[4] != MSP_GHOST_DP_ENDPOINT_VRX ||
+        payload[5] != MSP_GHOST_DP_ENDPOINT_CONFIGURATOR) {
+        return false;
+    }
+
+    const uint16_t exchangeId = payload[8] | (payload[9] << 8);
+    if (ghostRelayMailbox.waiting &&
+        exchangeId == ghostRelayMailbox.exchangeId &&
+        payloadLength <= sizeof(ghostRelayMailbox.payload)) {
+        memcpy(ghostRelayMailbox.payload, payload, payloadLength);
+        ghostRelayMailbox.length = payloadLength;
+        ghostRelayMailbox.ready = true;
+        ghostRelayMailbox.waiting = false;
+    }
+    return true;
+}
+
 static uint32_t mspGhostDpMissionHash(void)
 {
     uint32_t hash = 2166136261u;
@@ -1171,7 +1195,7 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
         ghostRelayMailbox.length = 0;
         ghostRelayMailbox.waiting = true;
         ghostRelayMailbox.ready = false;
-        if (mspSerialPushPortRequest(MSP_DISPLAYPORT, payload, payloadLength,
+        if (mspSerialPushPort(MSP_DISPLAYPORT, payload, payloadLength,
                 osdPort, MSP_V2_NATIVE) <= 0) {
             ghostRelayMailbox.waiting = false;
             return MSP_RESULT_ERROR;

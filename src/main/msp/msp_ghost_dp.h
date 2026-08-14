@@ -122,6 +122,7 @@ typedef enum {
 } mspGhostDpFieldFlag_e;
 
 mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst);
+bool mspGhostDpProcessReply(sbuf_t *src);
 void mspGhostDpProcess(void);
 
 #endif // USE_MSP_GHOST_DP
