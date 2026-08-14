@@ -1171,7 +1171,7 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
         ghostRelayMailbox.length = 0;
         ghostRelayMailbox.waiting = true;
         ghostRelayMailbox.ready = false;
-        if (mspSerialPushPort(MSP_DISPLAYPORT, payload, payloadLength,
+        if (mspSerialPushPortRequest(MSP_DISPLAYPORT, payload, payloadLength,
                 osdPort, MSP_V2_NATIVE) <= 0) {
             ghostRelayMailbox.waiting = false;
             return MSP_RESULT_ERROR;

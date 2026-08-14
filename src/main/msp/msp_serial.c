@@ -299,11 +299,11 @@ static int mspSerialSendFrame(mspPort_t *msp, const uint8_t * hdr, int hdrLen, c
     return totalFrameLength;
 }
 
-static int mspSerialEncode(mspPort_t *msp, mspPacket_t *packet, mspVersion_e mspVersion)
+static int mspSerialEncodeDirection(mspPort_t *msp, mspPacket_t *packet, mspVersion_e mspVersion, bool request)
 {
     static const uint8_t mspMagic[MSP_VERSION_COUNT] = MSP_VERSION_MAGIC_INITIALIZER;
     const int dataLen = sbufBytesRemaining(&packet->buf);
-    uint8_t hdrBuf[16] = { '$', mspMagic[mspVersion], packet->result == MSP_RESULT_ERROR ? '!' : '>'};
+    uint8_t hdrBuf[16] = { '$', mspMagic[mspVersion], request ? '<' : (packet->result == MSP_RESULT_ERROR ? '!' : '>')};
     uint8_t crcBuf[2];
     int hdrLen = 3;
     int crcLen = 0;
@@ -389,6 +389,11 @@ static int mspSerialEncode(mspPort_t *msp, mspPacket_t *packet, mspVersion_e msp
 
     // Send the frame
     return mspSerialSendFrame(msp, hdrBuf, hdrLen, sbufPtr(&packet->buf), dataLen, crcBuf, crcLen);
+}
+
+static int mspSerialEncode(mspPort_t *msp, mspPacket_t *packet, mspVersion_e mspVersion)
+{
+    return mspSerialEncodeDirection(msp, packet, mspVersion, false);
 }
 
 static mspPostProcessFnPtr mspSerialProcessReceivedCommand(mspPort_t *msp, mspProcessCommandFnPtr mspProcessCommandFn)
@@ -522,6 +527,22 @@ int mspSerialPushPort(uint16_t cmd, const uint8_t *data, int datalen, mspPort_t 
     sbufSwitchToReader(&push.buf, pushBuf);
 
     return mspSerialEncode(mspPort, &push, version);
+}
+
+int mspSerialPushPortRequest(uint16_t cmd, const uint8_t *data, int datalen, mspPort_t *mspPort, mspVersion_e version)
+{
+    uint8_t pushBuf[MSP_PORT_OUTBUF_SIZE];
+
+    mspPacket_t push = {
+        .buf = { .ptr = pushBuf, .end = ARRAYEND(pushBuf), },
+        .cmd = cmd,
+        .result = 0,
+    };
+
+    sbufWriteData(&push.buf, data, datalen);
+    sbufSwitchToReader(&push.buf, pushBuf);
+
+    return mspSerialEncodeDirection(mspPort, &push, version, true);
 }
 
 int mspSerialPushVersion(uint8_t cmd, const uint8_t *data, int datalen, mspVersion_e version)
