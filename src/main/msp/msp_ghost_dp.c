@@ -252,6 +252,10 @@ static bool ghostStreamMapPending;
 static uint16_t ghostStreamMapExchangeId;
 static uint16_t ghostPushExchangeId;
 
+#ifdef USE_MSP_GHOST_DP_TEST_AHI_STREAM
+static bool ghostTestAhiStreamInitialized;
+#endif
+
 static uint32_t fnv1aByte(uint32_t hash, uint8_t value)
 {
     return (hash ^ value) * 16777619u;
@@ -811,6 +815,37 @@ static void mspGhostDpApplyQuote(uint32_t nowMs)
     }
     ghostQuote.valid = false;
 }
+
+#ifdef USE_MSP_GHOST_DP_TEST_AHI_STREAM
+static void mspGhostDpStartTestAhiStream(void)
+{
+    if (ghostTestAhiStreamInitialized) {
+        return;
+    }
+
+    mspGhostDpInitSession();
+    const uint32_t nowUs = micros();
+    const uint16_t fieldIds[] = { 1, 2 }; // PITCH, ROLL
+
+    ghostStream = (mspGhostDpStream_t) {
+        .active = true,
+        .leaseSeconds = 0,
+        .entryCount = ARRAYLEN(fieldIds),
+    };
+    mspGhostDpNextGeneration();
+    for (unsigned index = 0; index < ARRAYLEN(fieldIds); ++index) {
+        mspGhostDpStreamEntry_t *entry = &ghostStream.entries[index];
+        entry->slot = index;
+        entry->effectiveRateHz = 30;
+        entry->nextDueUs = nowUs;
+        entry->field = mspGhostDpFindField(fieldIds[index]);
+        ghostStream.effectiveBps +=
+            mspGhostDpEstimateFieldBps(entry->field, entry->effectiveRateHz);
+    }
+    mspGhostDpScheduleStreamMap(0);
+    ghostTestAhiStreamInitialized = true;
+}
+#endif
 
 static int mspGhostDpPushStreamMap(void)
 {
@@ -1477,7 +1512,11 @@ mspResult_e mspGhostDpProcessCommand(sbuf_t *src, sbuf_t *dst)
 
 void mspGhostDpProcess(void)
 {
+#ifdef USE_MSP_GHOST_DP_TEST_AHI_STREAM
+    mspGhostDpStartTestAhiStream();
+#else
     mspGhostDpExpireStream(millis());
+#endif
     if (ghostStreamMapPending) {
         if (mspGhostDpPushStreamMap() > 0) {
             ghostStreamMapPending = false;

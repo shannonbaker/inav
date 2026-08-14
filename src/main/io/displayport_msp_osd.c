@@ -507,18 +507,21 @@ displayPort_t* mspOsdDisplayPortInit(const videoSystem_e videoSystem)
  */
 static mspResult_e processMspCommand(mspPacket_t *cmd, mspPacket_t *reply, mspPostProcessFnPtr *mspPostProcessFn)
 {
-#ifdef USE_MSP_GHOST_DP
-    if (cmd->cmd == MSP_DISPLAYPORT && mspGhostDpProcessReply(&cmd->buf)) {
-        return MSP_RESULT_NO_REPLY;
-    }
-#endif
-
     if ((vtxSeen && !vtxActive) || (cmd->cmd == MSP_EEPROM_WRITE)) {
         vtxReset = true;
     }
 
     vtxSeen = vtxActive = true;
     vtxHeartbeat = millis();
+
+#ifdef USE_MSP_GHOST_DP
+    // GHOST replies share the MSP OSD transport and therefore also prove that
+    // the peer is alive. Refresh link activity before consuming the reply;
+    // otherwise the early return lets VTX_TIMEOUT suppress OSD output.
+    if (cmd->cmd == MSP_DISPLAYPORT && mspGhostDpProcessReply(&cmd->buf)) {
+        return MSP_RESULT_NO_REPLY;
+    }
+#endif
 
     // Process MSP command
     return mspProcessCommand(cmd, reply, mspPostProcessFn);

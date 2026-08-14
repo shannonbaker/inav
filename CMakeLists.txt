@@ -12,9 +12,17 @@ set(TOOLS_DIR "${MAIN_DIR}/tools")
 
 option(SITL "SITL build for host system" OFF)
 option(MSP_GHOST_DP "Enable native GHOST fields and missions over MSP DisplayPort" OFF)
+option(MSP_GHOST_DP_TEST_AHI_STREAM "Test-only unsolicited GHOST pitch/roll stream" OFF)
 
 if (MSP_GHOST_DP)
     add_compile_definitions(USE_MSP_GHOST_DP USE_MSP_DISPLAYPORT)
+endif()
+
+if (MSP_GHOST_DP_TEST_AHI_STREAM)
+    if (NOT MSP_GHOST_DP)
+        message(FATAL_ERROR "MSP_GHOST_DP_TEST_AHI_STREAM requires MSP_GHOST_DP")
+    endif()
+    add_compile_definitions(USE_MSP_GHOST_DP_TEST_AHI_STREAM)
 endif()
 
 set(TOOLCHAIN_OPTIONS none arm-none-eabi host)
